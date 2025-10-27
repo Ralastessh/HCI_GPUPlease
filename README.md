@@ -29,7 +29,7 @@ finance_crawling/
 pip install -r requirements.txt
 
 # 2. Run the spider
-scrapy crawl finance_spider -o report_period.csv
+scrapy crawl report -o report_period.csv
 ```
 
 ---
