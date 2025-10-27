@@ -1,75 +1,10 @@
 import scrapy
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from finance_test.items import NewsItem
 from finance_test.items import ReportItem
 
-'''class NewsSpider(scrapy.Spider):
-    name = "news"
-    allowed_domains = ["naver.com"]
-    start_urls = [
-        "https://finance.naver.com/news/news_list.naver?mode=LSS2D&section_id=101&section_id2=258"
-    ]
 
-    custom_settings = {
-        'ROBOTSTXT_OBEY': False,
-        'DEFAULT_REQUEST_HEADERS': {
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
-                          'AppleWebKit/537.36 (KHTML, like Gecko) '
-                          'Chrome/124.0.0.0 Safari/537.36',
-            'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7'
-        }
-    }
-
-    def parse(self, response):
-        print("==== RESPONSE STATUS ====", response.status)
-        print("==== PAGE TITLE ====", response.xpath('//title/text()').get())
-
-        # 모든 기사 블록에서 a 태그 전부 수집 (뉴스 목록 전부)
-        links = response.xpath('//*[@id="contentarea_left"]/ul[contains(@class,"realtimeNewsList")]/li/dl/dt/a/@href').getall()
-        print(f"FOUND {len(links)} article links (filtered)")
-
-        for link in links:
-            office_match = re.search(r'office_id=(\d+)', link)
-            article_match = re.search(r'article_id=(\d+)', link)
-
-            if office_match and article_match:
-                office_id = office_match.group(1)
-                article_id = article_match.group(1)
-
-                new_link = f"https://n.news.naver.com/mnews/article/{office_id}/{article_id}"
-                yield response.follow(new_link, self.parse_article)
-
-    def parse_article(self, response):
-        item = NewsItem()
-
-        article_match = re.search(r'/article/\d+/(\d+)', response.url)
-        office_match = re.search(r'/article/(\d+)/\d+', response.url)
-
-        item['article_id'] = article_match.group(1) if article_match else None
-        item['media_id'] = office_match.group(1) if office_match else None
-        item['media_name'] = response.xpath(
-            '//img[contains(@class,"media_end_head_top_logo_img")]/@alt | '
-            '//img[contains(@class,"media_end_head_top_logo_img")]/@title'
-        ).get()
-
-        # 제목 수정 — span 포함 모든 텍스트 수집
-        item['title'] = ''.join(response.xpath(
-            '//h2[contains(@class,"media_end_head_headline")]//text()'
-        ).getall()).strip()
-
-        item['article_published_at'] = response.xpath(
-            '//span[contains(@class,"media_end_head_info_datestamp_time")]/@data-date-time'
-        ).get()
-
-        item['link'] = response.url
-        item['created_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        item['latest_scraped_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        item['ticker'] = None
-
-        yield item'''
-        
-        
 class ReportSpider(scrapy.Spider):
     # '네이버증권 리서치' 메인 화면
     name = 'report'
@@ -120,7 +55,22 @@ class ReportSpider(scrapy.Spider):
         current_page = int(current_page_match.group(1)) if current_page_match else 1
 
         rows = response.xpath('//table[@class="type_1"]//tr[td[@class="date"]]')
+        # 기준일(ex. days=1 -> 하루치) 설정
+        cutoff_date = datetime.now() - timedelta(days=1)
+        stop_crawling = False
+
         for row in rows:
+            date_str = row.xpath('./td[@class="date"]/text()').get()
+            try:
+                article_date = datetime.strptime(date_str.strip(), "%y.%m.%d")
+            except Exception:
+                continue
+
+            # 1년보다 이전이면 중단 플래그
+            if article_date < cutoff_date:
+                stop_crawling = True
+                break
+
             # csv에 포함될 속성 값 크롤링
             item = ReportItem()
             item['report_name'] = report_name
@@ -155,15 +105,14 @@ class ReportSpider(scrapy.Spider):
             item['original_id'] = match.group(1) if match else None
             # '종목분석'과 '산업분석' 리포트의 제목 지정 예외 처리(제목보다 우선순위 속성 있기 때문)
             item['firm_name'] = (row.xpath('string(./td[3])').get().strip() or row.xpath('string(./td[2])').get().strip())      
-            item['article_published_at'] = row.xpath('./td[@class="date"]/text()').get()
+            item['article_published_at'] = date_str
             item['created_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             item['latest_scraped_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             yield response.follow(item['link'], self.parse_report_detail, meta={'item': item})
 
-        # 몇 페이지까지 탐색할 건지 지정 가능(ex. 1~10 페이지만 탐색)
-        if current_page < 10:
+        # 오래된 데이터가 나오면 이후 페이지 탐색 중단
+        if not stop_crawling:
             next_page = response.xpath('//td[@class="pgR"]/a/@href').get()
-            # 다음 페이지로 이동
             if next_page:
                 yield response.follow(next_page, self.parse_report_list, meta={'report_name': report_name})
 
