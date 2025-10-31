@@ -3,6 +3,9 @@ import re
 from datetime import datetime, timedelta
 from finance_test.items import NewsItem
 from finance_test.items import ReportItem
+import time
+import math
+from scrapy import signals
 
 
 class ReportSpider(scrapy.Spider):
@@ -31,8 +34,37 @@ class ReportSpider(scrapy.Spider):
             'created_at',
             'latest_scraped_at',
             'original_id'
-        ]
+        ],
+        # 로그 레벨 설정: INFO 기본, 내부 디버그 로그 숨김
+        'LOG_LEVEL': 'INFO',
+        'LOGGING': {
+            'version': 1,
+            'disable_existing_loggers': False,
+            'loggers': {
+                'scrapy.core.engine':           {'level': 'WARNING'},
+                'scrapy.core.scraper':          {'level': 'WARNING'},
+                'scrapy.extensions.feedexport': {'level': 'WARNING'},
+                'scrapy.spiderloader':          {'level': 'WARNING'},
+            },
+        },
     }
+
+    @classmethod
+    def from_crawler(cls, crawler, *args, **kwargs):
+        spider = super().from_crawler(crawler, *args, **kwargs)
+        crawler.signals.connect(spider.spider_opened, signal=signals.spider_opened)
+        crawler.signals.connect(spider.spider_closed, signal=signals.spider_closed)
+        return spider
+
+    def spider_opened(self):
+        self.start_time = time.time()
+        self.pages_processed = 0
+        self.total_pages = 0
+        self.section_seen = set()
+
+    def spider_closed(self, spider):
+        total_time = time.time() - self.start_time
+        self.logger.info(f"=== Crawl completed in {total_time:.2f} seconds ===")
 
     # Spider 부모 클래스 내장 메소드
     
@@ -54,9 +86,18 @@ class ReportSpider(scrapy.Spider):
         current_page_match = re.search(r'page=(\d+)', response.url)
         current_page = int(current_page_match.group(1)) if current_page_match else 1
 
+        if report_name not in self.section_seen:
+            last_page_href = response.xpath("//td[@class='pgRR']/a/@href").get()
+            if last_page_href:
+                match = re.search(r'page=(\d+)', last_page_href)
+                if match:
+                    section_total = int(match.group(1))
+                    self.total_pages += section_total
+            self.section_seen.add(report_name)
+
         rows = response.xpath('//table[@class="type_1"]//tr[td[@class="date"]]')
         # 기준일(ex. days=1 -> 하루치) 설정
-        cutoff_date = datetime.now() - timedelta(days=1)
+        cutoff_date = datetime.now() - timedelta(days=365)
         stop_crawling = False
 
         for row in rows:
@@ -112,9 +153,23 @@ class ReportSpider(scrapy.Spider):
 
         # 오래된 데이터가 나오면 이후 페이지 탐색 중단
         if not stop_crawling:
-            next_page = response.xpath('//td[@class="pgR"]/a/@href').get()
-            if next_page:
-                yield response.follow(next_page, self.parse_report_list, meta={'report_name': report_name})
+            # 현재 페이지 셀(.on)의 다음 형제 td에 있는 a 태그를 가져와 순차 페이지 탐색
+            next_rel = response.xpath('//td[@class="on"]/following-sibling::td[1]/a/@href').get()
+            if next_rel:
+                # After processing current page, update progress
+                self.pages_processed += 1
+                # update progress only every 10 pages or on the last page
+                if self.pages_processed % 10 == 0 or self.pages_processed == self.total_pages:
+                    elapsed = time.time() - self.start_time
+                    avg_per_page = elapsed / self.pages_processed if self.pages_processed else 0
+                    remaining_pages = max(self.total_pages - self.pages_processed, 0)
+                    eta = avg_per_page * remaining_pages
+                    eta_minutes = eta / 60.0
+                    bar_len = 20
+                    filled_len = math.floor(bar_len * self.pages_processed / self.total_pages)
+                    bar = '█' * filled_len + '-' * (bar_len - filled_len)
+                    self.logger.info(f"[{bar}] Page {self.pages_processed}/{self.total_pages} | ETA: {eta_minutes:.1f}m")
+                yield response.follow(next_rel, self.parse_report_list, meta={'report_name': report_name})
 
     # 리포트 스크립트
     def parse_report_detail(self, response):
