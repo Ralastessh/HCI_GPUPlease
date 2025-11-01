@@ -45,8 +45,8 @@ class ReportSpider(scrapy.Spider):
                 'scrapy.core.scraper':          {'level': 'WARNING'},
                 'scrapy.extensions.feedexport': {'level': 'WARNING'},
                 'scrapy.spiderloader':          {'level': 'WARNING'},
-            },
-        },
+            }
+        }
     }
 
     @classmethod
@@ -97,7 +97,7 @@ class ReportSpider(scrapy.Spider):
 
         rows = response.xpath('//table[@class="type_1"]//tr[td[@class="date"]]')
         # 기준일(ex. days=1 -> 하루치) 설정
-        cutoff_date = datetime.now() - timedelta(days=365)
+        cutoff_date = datetime.now() - timedelta(days=3)
         stop_crawling = False
 
         for row in rows:
