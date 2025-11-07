@@ -1,33 +1,55 @@
-# spiders/naver_item_news.py
+# spiders/naver_item_news.py (요청 사양 반영 확장판)
 import re
-import scrapy
-from urllib.parse import urljoin, urlparse, parse_qs
 from pathlib import Path
-from datetime import datetime, timedelta, timezone, date
-from zoneinfo import ZoneInfo
+from urllib.parse import urljoin, urlparse, parse_qs
 from uuid import uuid5, NAMESPACE_URL
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+import scrapy
 
 
-# ───────────────────────── common helpers ─────────────────────────
-def _clean(s: str | None):
+CODE_RE = re.compile(r"^\d{6}$")
+BASE_NEWS_URL = "https://finance.naver.com/item/news_news.naver"
+
+OUT_FIELDS = [
+    "uuid", "press", "article_id", "title", "code", "link", "texts",
+    "article_published_at", "created_at", "latest_scraped_at",
+]
+
+
+def _build_list_url(code: str, page: int) -> str:
+    # 1페이지는 page 파라미터를 빈 값으로 두는 것이 안정적
+    if page <= 1:
+        return f"{BASE_NEWS_URL}?code={code}&page=&clusterId="
+    return f"{BASE_NEWS_URL}?code={code}&page={page}&clusterId="
+
+
+def _clean(s: str | None) -> str | None:
     if not s:
         return None
     s = s.replace("\xa0", " ").strip()
-    return re.sub(r"\s+", " ", s) or None
+    s = re.sub(r"\s+", " ", s)
+    return s or None
 
 
-def _now_kst() -> datetime:
-    return datetime.now(timezone.utc).astimezone(ZoneInfo("Asia/Seoul"))
+def _normalize_text_block(s: str | None) -> str | None:
+    if not s:
+        return None
+    lines = [re.sub(r"\s+", " ", ln).strip() for ln in s.splitlines()]
+    text = "\n".join([ln for ln in lines if ln])
+    return text or None
 
 
 def _now_kst_str() -> str:
-    return _now_kst().strftime("%Y-%m-%d %H:%M:%S")
+    # YYYY-MM-DD HH:MM:SS (KST)
+    return datetime.now(timezone.utc).astimezone(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _to_yymmdd(text: str | None) -> str | None:
+def _parse_ymd_to_yymmdd(text: str | None) -> str | None:
     """
-    입력 예: '2025.10.24', '2025-10-24', '2025.10.24 09:10', ...
-    출력 예: '25.10.24'
+    입력 예시: '2025.10.24', '2025.10.24 09:10', '2025-10-24', ...
+    출력: '25.10.24' (YY.MM.DD)
     """
     if not text:
         return None
@@ -35,316 +57,230 @@ def _to_yymmdd(text: str | None) -> str | None:
     if not m:
         return None
     y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
-    return f"{y % 100:02d}.{mo:02d}.{d:02d}"
+    return f"{y%100:02d}.{mo:02d}.{d:02d}"
 
 
-def _to_date(text: str | None) -> date | None:
+def _extract_oid_aid_from_url(url: str) -> tuple[str | None, str | None]:
     """
-    입력: '2025.10.24' / '2025-10-24' / '25.10.24' 등
-    출력: datetime.date
+    /news_read.naver?office_id=277&article_id=0005709756 또는
+    /article/277/0005709756 형태 모두 지원
     """
-    if not text:
+    try:
+        p = urlparse(url)
+        # path 패턴 우선 (/article/oid/aid)
+        parts = [x for x in p.path.split("/") if x]
+        if len(parts) >= 3 and parts[-3] == "article":
+            oid, aid = parts[-2], parts[-1]
+            if (oid or "").isdigit() and (aid or "").isdigit():
+                return oid, aid
+        # 쿼리스트링 (office_id, article_id / oid, aid)
+        qs = parse_qs(p.query)
+        oid = (qs.get("office_id") or qs.get("oid") or [None])[0]
+        aid = (qs.get("article_id") or qs.get("aid") or [None])[0]
+        return oid, aid
+    except Exception:
+        return None, None
+
+
+def _canonical_article_url(oid: str | None, aid: str | None) -> str | None:
+    if not (oid and aid):
         return None
-    # 4자리 연도
-    m = re.search(r"(?P<y>\d{4})[.\-/](?P<m>\d{1,2})[.\-/](?P<d>\d{1,2})", text)
-    if m:
-        return date(int(m.group("y")), int(m.group("m")), int(m.group("d")))
-    # 2자리 연도(네이버 뉴스는 2000년대 가정)
-    m = re.search(r"(?P<y>\d{2})[.\-/](?P<m>\d{1,2})[.\-/](?P<d>\d{1,2})", text)
-    if m:
-        y = 2000 + int(m.group("y"))
-        return date(y, int(m.group("m")), int(m.group("d")))
-    return None
+    return f"https://news.naver.com/article/{oid}/{aid}"
 
 
-# ───────────────────────── spider ─────────────────────────
 class NaverItemNewsSpider(scrapy.Spider):
     """
-    codes_all.txt(한 줄당 6자리 종목코드)에서 코드를 읽어
-    https://finance.naver.com/item/news_news.naver?code=... 리스트를 순회하고,
-    각 행의 링크에서 OID/AID를 추출하여
-    https://news.naver.com/article/{oid}/{aid} 데스크톱 기사 페이지에서 본문을 수집한다.
-
-    정책:
-      - 최근 since_days(기본 365일) 이전 기사만 수집
-      - max_pages 상한 없음. 한 페이지에서라도 '최근 기사'가 하나도 없으면 해당 종목은 중단
+    codes_kosdaq.txt(혹은 -a codes_path=...)에서 6자리 종목코드를 읽어
+    각 코드의 '종목뉴스' 리스트(news_news.naver)를 순회.
+    기사 상세로 진입해 본문/발행일을 확보하고,
+    지정된 OUT_FIELDS로 방출한다.
     """
     name = "naver_item_news"
     allowed_domains = ["finance.naver.com", "news.naver.com", "n.news.naver.com", "naver.com"]
 
     custom_settings = {
-        "ROBOTSTXT_OBEY": False,
-        "DOWNLOAD_DELAY": 0.6,
-        "RANDOMIZE_DOWNLOAD_DELAY": True,
         "DEFAULT_REQUEST_HEADERS": {
             "User-Agent": (
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/126.0.0.0 Safari/537.36"
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
             ),
             "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Referer": "https://finance.naver.com/",
         },
+        "DOWNLOAD_DELAY": 0.4,
+        "RANDOMIZE_DOWNLOAD_DELAY": True,
+        "CONCURRENT_REQUESTS_PER_DOMAIN": 2,
         "FEED_EXPORT_ENCODING": "utf-8",
+        "ROBOTSTXT_OBEY": False,
         "LOG_LEVEL": "INFO",
+        # 출력 필드 순서 고정
+        "FEEDS": {
+            "item_news_%(time)s.csv": {
+                "format": "csv",
+                "encoding": "utf-8-sig",
+                "fields": OUT_FIELDS,
+            }
+        },
     }
 
-    # ───────── init ─────────
-    def __init__(
-        self,
-        codes_file: str = "codes_all.txt",
-        since_days: int = 365,
-        *args, **kwargs
-    ):
-        """
-        codes_file: 종목코드 파일 경로(UTF-8 권장, BOM 허용). 한 줄당 6자리 숫자.
-        since_days: 오늘(KST) 기준 며칠 전까지 수집(기본 365일)
-        """
+    def __init__(self, codes_path: str = "codes_kosdaq.txt", max_pages: int | None = None, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.codes_file = Path(codes_file)
-        self.since_days = int(since_days)
-        self.cutoff_date = (_now_kst() - timedelta(days=self.since_days)).date()
+        self.codes_path = codes_path
+        self.max_pages = int(max_pages) if max_pages else None
+        self._codes: list[str] = []
 
-        self.codes = self._load_codes(self.codes_file)
-        if not self.codes:
-            raise ValueError(
-                f"[naver_item_news] codes_file='{self.codes_file}'에서 종목코드를 하나도 못 읽었어요."
-            )
-
-        self.articles_seen: set[str] = set()  # 기사 URL 중복 제거
-        self.dump_dir = Path("dumps")
-        self.dump_dir.mkdir(exist_ok=True)
-
-    # ───────── helpers ─────────
-    @staticmethod
-    def _load_codes(path: Path) -> list[str]:
-        """
-        파일 형식:
-          - 한 줄당 6자리 코드 (예: 005930)
-          - 주석 허용: # 으로 시작하는 줄
-          - 공백/탭/빈줄 무시
-        """
+    # ---- load codes
+    def _read_codes(self) -> list[str]:
+        p = Path(self.codes_path)
+        if not p.exists():
+            raise FileNotFoundError(f"codes file not found: {p.resolve()}")
         codes: list[str] = []
-        if not path.exists():
-            return codes
-        text = path.read_text(encoding="utf-8-sig")  # BOM 대응
-        for ln in text.splitlines():
-            ln = ln.strip()
-            if not ln or ln.startswith("#"):
-                continue
-            m = re.fullmatch(r"\d{6}", ln)
-            if m:
-                codes.append(m.group(0))
-        # 입력 순서 유지하며 중복 제거
-        seen, uniq = set(), []
-        for c in codes:
-            if c not in seen:
-                seen.add(c)
-                uniq.append(c)
-        return uniq
+        for ln in p.read_text(encoding="utf-8").splitlines():
+            c = ln.strip()
+            if CODE_RE.fullmatch(c):
+                codes.append(c)
+        return sorted(set(codes))
 
-    @staticmethod
-    def _finance_list_url(code: str, page: int) -> str:
-        return f"https://finance.naver.com/item/news_news.naver?code={code}&page={page}&clusterId="
-
-    @staticmethod
-    def _extract_oid_aid_from_href(href: str) -> tuple[str | None, str | None]:
-        """
-        /item/news_read.naver?article_id=0005678901&office_id=123&code=005930&page=1...
-        또는 read.naver?oid=...&aid=... 형태 모두 대응
-        """
-        try:
-            p = urlparse(href)
-            qs = parse_qs(p.query)
-            oid = qs.get("office_id", [None])[0]
-            aid = qs.get("article_id", [None])[0]
-            # 대체 파라미터
-            if not (oid and aid):
-                oid = qs.get("oid", [oid])[0]
-                aid = qs.get("aid", [aid])[0]
-            return oid, aid
-        except Exception:
-            return None, None
-
-    @staticmethod
-    def _canonical_article_url(oid: str | None, aid: str | None, fallback: str | None = None) -> str | None:
-        if oid and aid:
-            return f"https://news.naver.com/article/{oid}/{aid}"
-        return fallback
-
-    @staticmethod
-    def _tidy_texts(response) -> str | None:
-        """
-        본문은 #dic_area(신규 레이아웃)를 우선, 실패 시 폴백을 순서대로 시도.
-        줄바꿈을 살짝 유지한 뒤 공백 정리.
-        """
-        selectors = [
-            "#dic_area *::text",
-            "#dic_area::text",
-            "#newsct_article *::text",
-            "#newsct_article::text",
-            "#contents *::text",
-            "#contents::text",
-            "article *::text",
-            "article::text",
-        ]
-        for sel in selectors:
-            parts = response.css(sel).getall()
-            if parts:
-                joined = "\n".join([p for p in parts if _clean(p)])
-                return _clean(joined)
-        any_text = response.xpath("string(//body)").get()
-        return _clean(any_text)
-
-    def _make_uuid(self, canonical_url_or_any: str) -> str:
-        return str(uuid5(NAMESPACE_URL, canonical_url_or_any))
-
-    # ───────── entry ─────────
     def start_requests(self):
-        self.logger.info(
-            f"[naver_item_news] codes_file='{self.codes_file}', "
-            f"codes={len(self.codes)}개, cutoff={self.cutoff_date}"
-        )
-        for code in self.codes:
+        self._codes = self._read_codes()
+        self.logger.info("Loaded %d codes from %s", len(self._codes), self.codes_path)
+        for code in self._codes:
+            url = _build_list_url(code, 1)
             yield scrapy.Request(
-                self._finance_list_url(code, 1),
-                callback=self.parse_finance_list,
+                url,
+                callback=self.parse_list,
                 cb_kwargs={"code": code, "page": 1},
+                dont_filter=True,
             )
 
-    # ───────── list page ─────────
-    def parse_finance_list(self, response, code: str, page: int):
-        """
-        네이버 금융 종목 뉴스 리스트(table.type5) 파싱.
-        - 이 페이지에서 cutoff(최근 1년 등) 이후 기사가 하나라도 있으면 다음 페이지로 진행
-        - 하나도 없으면 해당 종목은 중단
-        """
+    # ---- list page
+    def parse_list(self, response, code: str, page: int):
         rows = response.css("table.type5 > tbody > tr")
-        if not rows:
-            return  # 빈 페이지 = 종료
-
-        page_has_recent = False
+        found_any = False
 
         for tr in rows:
-            href = tr.css('a[href*="news_read.naver"]::attr(href)').get() \
-                   or tr.css('a[href*="read.naver"]::attr(href)').get()
-            if not href:
+            a = tr.css("td.title > a::attr(href)").get()
+            if not a:
                 continue
-            abs_href = urljoin(response.url, href)
+            href = urljoin(response.url, a)
 
-            # 날짜(우측 정렬 셀/클래스가 다를 수 있어 후보를 여럿 시도)
-            date_text = _clean(tr.css("td.date::text").get()) \
-                     or _clean(tr.css("td[align='right']::text").get()) \
-                     or _clean(tr.css("td:nth-last-child(1)::text").get())
-            item_date = _to_date(date_text)
-
-            # 날짜 컷: 최근 범위에 속하지 않으면 스킵
-            if item_date and item_date >= self.cutoff_date:
-                page_has_recent = True
-            else:
+            # 기사 링크만 통과
+            if "/item/news_read.naver" not in href and "/news/news_read.naver" not in href:
                 continue
 
-            # 언론사 힌트(리스트에 보이는 값)
-            press_hint = _clean(tr.css("td.info::text").get()) \
-                      or _clean(tr.css("span.press::text").get()) \
-                      or _clean(tr.css("td:nth-child(3)::text").get())
+            found_any = True
+            title = _clean(tr.css("td.title > a::text").get())
+            press = _clean(tr.css("td.info::text").get())
+            # 목록의 날짜(있으면 우선 사용); YY.MM.DD로 후처리 예정
+            list_date_raw = _clean(tr.css("td.date::text, span.date::text").get())
 
-            # OID/AID → 데스크톱 기사 URL 정규화
-            oid, aid = self._extract_oid_aid_from_href(abs_href)
-            article_url = self._canonical_article_url(oid, aid, fallback=abs_href)
-            if not article_url or article_url in self.articles_seen:
-                continue
-            self.articles_seen.add(article_url)
-
+            # 상세 페이지로 들어가 본문/발행일 보강
             yield scrapy.Request(
-                article_url,
+                href,
                 callback=self.parse_article,
+                headers={"Referer": response.url},
                 cb_kwargs={
                     "code": code,
-                    "source_list_url": response.url,
-                    "press_hint": press_hint,
-                    "article_published_at_hint": _to_yymmdd(date_text),
+                    "title_from_list": title,
+                    "press_from_list": press,
+                    "list_date_raw": list_date_raw,
                 },
             )
 
-        # 다음 페이지로 갈지 결정 (max_pages 제한 없음)
-        if page_has_recent:
-            next_url = self._finance_list_url(code, page + 1)
+        # 페이지네이션 제어
+        if self.max_pages is not None and page >= self.max_pages:
+            return
+
+        # 끝 페이지 파악 (pgRR)
+        last_page = None
+        rr = response.css("a.pgRR::attr(href)").get()
+        if rr:
+            q = parse_qs(urlparse(urljoin(response.url, rr)).query)
+            last_page = int((q.get("page") or ["1"])[0])
+
+        if found_any:
+            if last_page is not None and page >= last_page:
+                return
+            next_page = page + 1
+            next_url = _build_list_url(code, next_page)
             yield scrapy.Request(
                 next_url,
-                callback=self.parse_finance_list,
-                cb_kwargs={"code": code, "page": page + 1},
+                callback=self.parse_list,
+                cb_kwargs={"code": code, "page": next_page},
+                dont_filter=True,
             )
-        # else: 최근 기사 하나도 없으므로 이 종목은 여기서 중단
 
-    # ───────── article page ─────────
-    def parse_article(self, response, code: str, source_list_url: str,
-                      press_hint: str | None, article_published_at_hint: str | None):
+    # ---- article page
+    def parse_article(self, response, code: str, title_from_list: str | None, press_from_list: str | None, list_date_raw: str | None):
+        # oid/aid 추출 및 링크 정규화
+        oid, aid = _extract_oid_aid_from_url(response.url)
+        link = _canonical_article_url(oid, aid) or response.url
+        article_id = aid or None
 
-        # 제목
-        title = (
-            _clean(response.css("#title_area > span::text").get())
-            or _clean(response.css("#title_area::text").get())
-            or _clean(response.css("h1, h2").xpath("string(.)").get())
+        # 제목/언론사 보강 (목록 우선)
+        title = title_from_list or _clean(
+            response.css("#title_area > span::text").get()
+            or response.css("#title_area::text").get()
+            or response.css("h1, h2").xpath("string(.)").get()
+        )
+        press = press_from_list or _clean(
+            response.css("#ct .media_end_head_top a img::attr(title)").get()
+            or response.css('meta[property="og:article:author"]::attr(content)').get()
+            or response.css('meta[name="twitter:creator"]::attr(content)').get()
+            or response.css(".media_end_head_top_logo::text, .media_end_linked_more::text").get()
+            or response.css(".media_end_head_top a::text").get()
         )
 
-        # 입력(게시) 시각 → YY.MM.DD
-        ts_nodes = response.css(".media_end_head_info_datestamp_time")
-        published_raw = None
-        if len(ts_nodes) >= 1:
-            published_raw = (
-                ts_nodes[0].attrib.get("data-date-time")
-                or ts_nodes[0].attrib.get("data-modify-date-time")
-                or ts_nodes[0].xpath("string(.)").get()
+        # 본문 추출 (여러 셀렉터 폴백)
+        texts = None
+        raw = response.css("#dic_area").xpath("string(.)").get()
+        texts = _normalize_text_block(raw or "")
+        if not texts:
+            for sel in ["#newsct_article", "#contents", "article", "[itemprop='articleBody']"]:
+                raw = response.css(sel).xpath("string(.)").get()
+                texts = _normalize_text_block(raw or "")
+                if texts:
+                    break
+
+        # 발행일: 목록 날짜가 있으면 우선 -> YY.MM.DD
+        article_published_at = _parse_ymd_to_yymmdd(list_date_raw)
+
+        # 목록에 없으면 본문 헤더의 data-date-time 등을 탐색
+        if not article_published_at:
+            # data-date-time (예: 2025-10-24 09:10:33)
+            cand = (
+                response.css(".media_end_head_info_datestamp_time::attr(data-date-time)").get()
+                or response.css(".media_end_head_info_datestamp_time::text").get()
+                or response.css("#ct .media_end_head_info_datestamp span::attr(data-date-time)").get()
+                or response.css("#ct .media_end_head_info_datestamp span::text").get()
             )
-        article_published_at = _to_yymmdd(_clean(published_raw)) or article_published_at_hint
+            cand = _clean(cand)
+            article_published_at = _parse_ymd_to_yymmdd(cand)
 
-        # 언론사
-        press = _clean(
-            response.css(
-                "#ct > div.media_end_head.go_trans > "
-                "div.media_end_head_top._LAZY_LOADING_WRAP > a > img:nth-child(1)::attr(title)"
-            ).get()
-        ) or _clean(response.css("div.media_end_head_top a img::attr(title)").get()) \
-          or _clean(response.css('meta[property="og:article:author"]::attr(content)').get()) \
-          or _clean(response.css('meta[name="twitter:creator"]::attr(content)').get()) \
-          or _clean(response.css(".media_end_head_top_logo::text, .media_end_linked_more::text").get()) \
-          or _clean(response.css(".media_end_head_top a::text").get()) \
-          or press_hint
-
-        # 본문
-        texts = self._tidy_texts(response)
-
-        # OID/AID 및 링크 재확인
-        def _extract_oid_aid(url: str):
-            try:
-                p = urlparse(url)
-                parts = [x for x in p.path.split("/") if x]
-                if len(parts) >= 3 and parts[-3] == "article":
-                    return parts[-2], parts[-1]
-                qs = parse_qs(p.query)
-                return qs.get("oid", [None])[0], qs.get("aid", [None])[0]
-            except Exception:
-                return None, None
-
-        oid, aid = _extract_oid_aid(response.url)
-        article_id = aid or None
-        link = self._canonical_article_url(oid, aid, fallback=response.url)
-
-        uuid_val = self._make_uuid(link)
+        # 타임스탬프들
         created_at = _now_kst_str()
+        latest_scraped_at = created_at
+
+        # uuid 생성(정규화된 기사 링크 기준)
+        uid_base = link
+        uuid_val = str(uuid5(NAMESPACE_URL, uid_base))
 
         yield {
             "uuid": uuid_val,
-            "article_id": article_id,
-            "stock_code": code,
             "press": press,
+            "article_id": article_id,
             "title": title,
-            "link": link,                           # 정규화된 데스크톱 기사 링크
-            "texts": texts,                         # 본문 텍스트
-            "article_published_at": article_published_at,  # 'YY.MM.DD'
-            "created_at": created_at,                        # 'YYYY-MM-DD HH:MM:SS' (KST)
-            "latest_scraped_at": created_at,
-            "source_list_url": source_list_url,     # 시작 리스트 URL(추적용)
+            "code": code,
+            "link": link,
+            "texts": texts,
+            "article_published_at": article_published_at,   # 예: '25.10.24'
+            "created_at": created_at,                       # 예: '2025-10-27 20:52:49'
+            "latest_scraped_at": latest_scraped_at,         # 예: '2025-10-27 20:52:49'
         }
+
+
+'''
+실행 예시: 
+
+'''
