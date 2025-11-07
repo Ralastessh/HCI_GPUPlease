@@ -90,7 +90,7 @@ def _canonical_article_url(oid: str | None, aid: str | None) -> str | None:
 
 class NaverItemNewsSpider(scrapy.Spider):
     """
-    codes_all.txt(혹은 -a codes_path=...)에서 6자리 종목코드를 읽어
+    codes_kosdaq.txt(혹은 -a codes_path=...)에서 6자리 종목코드를 읽어
     각 코드의 '종목뉴스' 리스트(news_news.naver)를 순회.
     기사 상세로 진입해 본문/발행일을 확보하고,
     지정된 OUT_FIELDS로 방출한다.
@@ -124,7 +124,7 @@ class NaverItemNewsSpider(scrapy.Spider):
         },
     }
 
-    def __init__(self, codes_path: str = "codes_all.txt", max_pages: int | None = None, *args, **kwargs):
+    def __init__(self, codes_path: str = "codes_kosdaq.txt", max_pages: int | None = None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.codes_path = codes_path
         self.max_pages = int(max_pages) if max_pages else None
