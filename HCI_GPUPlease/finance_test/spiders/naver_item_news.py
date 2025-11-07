@@ -347,3 +347,14 @@ class NaverItemNewsSpider(scrapy.Spider):
             "created_at": created_at,                       # 예: '2025-11-07 12:34:56'
             "latest_scraped_at": created_at,
         }
+
+
+'''
+python -m scrapy crawl naver_item_news \
+  -a codes_path=/Users/woojin/HCI_GPUPlease-2/HCI_GPUPlease/codes_kosdaq.txt \
+  -a since_days=365 \
+  -s FEEDS={} \
+  -s FEED_EXPORT_ENCODING=utf-8 \
+  -O /Users/woojin/HCI_GPUPlease-2/HCI_GPUPlease/finance_test/kosdaq_news.csv
+'''
+
