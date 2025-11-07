@@ -35,3 +35,14 @@ typing_extensions==4.15.0
 urllib3==2.5.0
 w3lib==2.3.1
 zope.interface==8.0.1
+psycopg2-binary==2.9.9
+langchain-postgres==0.0.6
+sqlalchemy==2.0.23
+langchain==0.1.0
+langchain-community==0.0.20
+langchain-huggingface==0.0.1
+transformers>=4.36.0
+torch>=2.1.0
+sentence-transformers>=2.6.0
+accelerate>=0.25.0
+python-dotenv==1.0.1
