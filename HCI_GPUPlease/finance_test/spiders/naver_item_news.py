@@ -3,21 +3,24 @@ import re
 from pathlib import Path
 from urllib.parse import urljoin, urlparse, parse_qs
 from uuid import uuid5, NAMESPACE_URL
-from datetime import datetime, timezone
+from datetime import datetime, date, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import scrapy
 
+# --------- 설정/상수 ----------
 CODE_RE = re.compile(r"^\d{6}$")
 BASE_NEWS_URL = "https://finance.naver.com/item/news_news.naver"
 
+# Scrapy 출력 필드 순서
 OUT_FIELDS = [
     "uuid", "press", "article_id", "title", "code", "link", "texts",
     "article_published_at", "created_at", "latest_scraped_at",
 ]
 
+# --------- 유틸 ----------
 def _build_list_url(code: str, page: int) -> str:
-    # 1페이지는 page를 공란으로 두는 것이 네이버 쪽에서 가장 안정적
+    # 1페이지는 page를 공란으로 두는 것이 네이버 쪽에서 더 안정적
     if page <= 1:
         return f"{BASE_NEWS_URL}?code={code}&page=&clusterId="
     return f"{BASE_NEWS_URL}?code={code}&page={page}&clusterId="
@@ -28,28 +31,60 @@ def _clean(s: str | None) -> str | None:
     s = s.replace("\xa0", " ").strip()
     return re.sub(r"\s+", " ", s) or None
 
+def _one_line(s: str | None) -> str | None:
+    """줄바꿈/탭 제거해서 완전 한 줄 문자열로."""
+    if s is None:
+        return None
+    s = re.sub(r"[\r\n\t]+", " ", s)
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    return s or None
+
 def _normalize_text_block(s: str | None) -> str | None:
+    """여러 줄 본문을 '한 줄'로 정규화."""
     if not s:
         return None
     lines = [re.sub(r"\s+", " ", ln).strip() for ln in s.splitlines()]
-    text = "\n".join([ln for ln in lines if ln])
-    return text or None
+    return _one_line(" ".join([ln for ln in lines if ln]))
+
+def _now_kst() -> datetime:
+    return datetime.now(timezone.utc).astimezone(ZoneInfo("Asia/Seoul"))
 
 def _now_kst_str() -> str:
-    return datetime.now(timezone.utc).astimezone(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d %H:%M:%S")
+    return _now_kst().strftime("%Y-%m-%d %H:%M:%S")
 
 def _parse_ymd_to_yymmdd(text: str | None) -> str | None:
     """
-    입력: '2025.10.24', '2025-10-24', '2025.10.24 09:10' 등
+    입력: '2025.10.24', '2025-10-24', '2025/10/24', '2025.10.24 09:10' 등
     출력: '25.10.24'
     """
+    dt = _to_date(text)
+    if not dt:
+        return None
+    return f"{dt.year%100:02d}.{dt.month:02d}.{dt.day:02d}"
+
+def _to_date(text: str | None) -> date | None:
+    """다양한 포맷의 날짜 문자열을 date로 파싱 (가능한 경우만)."""
     if not text:
         return None
+    text = text.strip()
+    # YYYY.MM.DD, YYYY-MM-DD, YYYY/MM/DD (+ time 허용)
     m = re.search(r"(\d{4})[.\-/](\d{1,2})[.\-/](\d{1,2})", text)
-    if not m:
-        return None
-    y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
-    return f"{y%100:02d}.{mo:02d}.{d:02d}"
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        try:
+            return date(y, mo, d)
+        except ValueError:
+            return None
+    # YY.MM.DD도 가끔 목록에 보일 수 있으니 보조 처리
+    m2 = re.search(r"(\d{2})[.\-/](\d{1,2})[.\-/](\d{1,2})", text)
+    if m2:
+        y, mo, d = int(m2.group(1)), int(m2.group(2)), int(m2.group(3))
+        y += 2000 if y < 70 else 1900  # 보수적 해석
+        try:
+            return date(y, mo, d)
+        except ValueError:
+            return None
+    return None
 
 def _extract_oid_aid_from_url(url: str) -> tuple[str | None, str | None]:
     """
@@ -77,12 +112,13 @@ def _canonical_article_url(oid: str | None, aid: str | None) -> str | None:
         return None
     return f"https://news.naver.com/article/{oid}/{aid}"
 
+# --------- 스파이더 ----------
 class NaverItemNewsSpider(scrapy.Spider):
     """
     codes_kosdaq.txt(또는 -a codes_path=...)에서 6자리 종목코드를 읽어
     네이버 금융 종목 뉴스 목록(news_news.naver)을 순회.
     각 항목의 상세에서 oid/aid를 추출해 news.naver.com 정규화 URL로 들어가
-    본문과 발행일을 수집.
+    본문과 발행일을 수집. (옵션: -a since_days=365 로 최근 N일만 수집)
     """
     name = "naver_item_news"
     allowed_domains = ["finance.naver.com", "news.naver.com", "n.news.naver.com", "naver.com"]
@@ -103,7 +139,7 @@ class NaverItemNewsSpider(scrapy.Spider):
         "FEED_EXPORT_ENCODING": "utf-8",
         "ROBOTSTXT_OBEY": False,
         "LOG_LEVEL": "INFO",
-        # 기본 FEEDS: 외부에서 -s FEEDS={} 주면 비활성화 가능
+        # 기본 FEEDS: 외부에서 -s FEEDS={}로 끌 수 있음
         "FEEDS": {
             "item_news_%(time)s.csv": {
                 "format": "csv",
@@ -113,10 +149,20 @@ class NaverItemNewsSpider(scrapy.Spider):
         },
     }
 
-    def __init__(self, codes_path: str = "codes_kosdaq.txt", max_pages: int | None = None, *args, **kwargs):
+    def __init__(
+        self,
+        codes_path: str = "codes_kosdaq.txt",
+        max_pages: int | None = None,
+        since_days: int | None = None,
+        *args, **kwargs
+    ):
         super().__init__(*args, **kwargs)
         self.codes_path = codes_path
         self.max_pages = int(max_pages) if max_pages else None
+        self.since_days = int(since_days) if since_days else None
+        self.cutoff_date: date | None = None
+        if self.since_days:
+            self.cutoff_date = (_now_kst() - timedelta(days=self.since_days)).date()
         self._codes: list[str] = []
 
     # ---------- load codes ----------
@@ -135,6 +181,8 @@ class NaverItemNewsSpider(scrapy.Spider):
     def start_requests(self):
         self._codes = self._read_codes()
         self.logger.info("Loaded %d codes from %s", len(self._codes), self.codes_path)
+        if self.cutoff_date:
+            self.logger.info("Cutoff date (since_days=%s): %s", self.since_days, self.cutoff_date.isoformat())
         for code in self._codes:
             url = _build_list_url(code, 1)
             yield scrapy.Request(
@@ -148,6 +196,7 @@ class NaverItemNewsSpider(scrapy.Spider):
     def parse_list(self, response, code: str, page: int):
         rows = response.css("table.type5 > tbody > tr")
         found_any = False
+        hit_older_than_cutoff = False
 
         for tr in rows:
             a = tr.css("td.title > a::attr(href)").get()
@@ -164,6 +213,14 @@ class NaverItemNewsSpider(scrapy.Spider):
             press = _clean(tr.css("td.info::text").get())
             list_date_raw = _clean(tr.css("td.date::text, span.date::text").get())
 
+            # 목록 날짜로 선 차단(최신 → 오래된 순 정렬 가정)
+            if self.cutoff_date:
+                dt = _to_date(list_date_raw)
+                if dt and dt < self.cutoff_date:
+                    hit_older_than_cutoff = True
+                    # 더 아래도 모두 오래된 가능성↑ → 이 코드의 페이지네이션 종료
+                    continue
+
             # 상세(중간 페이지)로 진입
             yield scrapy.Request(
                 href,
@@ -176,6 +233,10 @@ class NaverItemNewsSpider(scrapy.Spider):
                     "list_date_raw": list_date_raw,
                 },
             )
+
+        # cutoff로 멈춰야 하면 페이지네이션 중단
+        if hit_older_than_cutoff:
+            return
 
         # 페이지네이션 제어
         if self.max_pages is not None and page >= self.max_pages:
@@ -228,21 +289,21 @@ class NaverItemNewsSpider(scrapy.Spider):
         link = canonical or response.url
         article_id = aid or None
 
-        # 제목/언론사 보강
-        title = title_from_list or _clean(
+        # 제목/언론사 보강 (한 줄화)
+        title = _one_line(title_from_list or _clean(
             response.css("#title_area > span::text").get()
             or response.css("#title_area::text").get()
             or response.css("h1, h2").xpath("string(.)").get()
-        )
-        press = press_from_list or _clean(
+        ))
+        press = _one_line(press_from_list or _clean(
             response.css("#ct .media_end_head_top a img::attr(title)").get()
             or response.css('meta[property="og:article:author"]::attr(content)').get()
             or response.css('meta[name="twitter:creator"]::attr(content)').get()
             or response.css(".media_end_head_top_logo::text, .media_end_linked_more::text").get()
             or response.css(".media_end_head_top a::text").get()
-        )
+        ))
 
-        # 본문 추출 (여러 폴백)
+        # 본문 추출 (여러 폴백 → 한 줄화)
         raw = response.css("#dic_area").xpath("string(.)").get()
         texts = _normalize_text_block(raw or "")
         if not texts:
@@ -251,8 +312,9 @@ class NaverItemNewsSpider(scrapy.Spider):
                 texts = _normalize_text_block(raw or "")
                 if texts:
                     break
+        texts = _one_line(texts)
 
-        # 발행일: 목록 날짜 우선 → 없으면 본문 헤더 추출
+        # 발행일: 목록 날짜 우선 → 없으면 본문 헤더 추출 (그리고 YY.MM.DD로 직렬화)
         article_published_at = _parse_ymd_to_yymmdd(list_date_raw)
         if not article_published_at:
             cand = (
@@ -262,6 +324,13 @@ class NaverItemNewsSpider(scrapy.Spider):
                 or response.css("#ct .media_end_head_info_datestamp span::text").get()
             )
             article_published_at = _parse_ymd_to_yymmdd(_clean(cand))
+        article_published_at = _one_line(article_published_at)
+
+        # cutoff 검사(목록에서 못 걸렀을 때 대비)
+        if self.cutoff_date and article_published_at:
+            dt = _to_date(article_published_at)  # 'YY.MM.DD'도 지원
+            if dt and dt < self.cutoff_date:
+                return
 
         created_at = _now_kst_str()
         uuid_val = str(uuid5(NAMESPACE_URL, link))
@@ -274,7 +343,7 @@ class NaverItemNewsSpider(scrapy.Spider):
             "code": code,
             "link": link,
             "texts": texts,
-            "article_published_at": article_published_at,
-            "created_at": created_at,
+            "article_published_at": article_published_at,  # 예: '25.10.24'
+            "created_at": created_at,                       # 예: '2025-11-07 12:34:56'
             "latest_scraped_at": created_at,
         }
